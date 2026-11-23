@@ -28,3 +28,6 @@ pub use audio_processing::{AudioProcessing, AudioProcessingBuilder, Error};
 pub use config::Config;
 pub use stats::AudioProcessingStats;
 pub use stream_config::StreamConfig;
+
+mod noise_channel;
+pub use noise_channel::NoiseChannel;

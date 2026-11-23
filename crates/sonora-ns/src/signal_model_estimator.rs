@@ -107,7 +107,7 @@ fn update_spectral_lrt(
 }
 
 /// Extracts signal features and periodically updates the prior model.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct SignalModelEstimator {
     diff_normalization: f32,
     signal_energy_sum: f32,

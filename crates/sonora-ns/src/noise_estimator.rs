@@ -37,7 +37,7 @@ const LOG_TABLE: [f32; 129] = [
 /// Combines a quantile-based noise tracker with parametric white/pink noise
 /// modeling during the startup phase. After startup, uses speech probability
 /// to separate noise from speech in the spectrum update.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct NoiseEstimator {
     suppression_params: &'static SuppressionParams,
     white_noise_level: f32,

@@ -152,7 +152,7 @@ fn synthesis_qmf(
 // TwoBandsStates
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct TwoBandsStates {
     analysis_state1: [f32; QMF_STATE_SIZE],
     analysis_state2: [f32; QMF_STATE_SIZE],
@@ -192,6 +192,14 @@ pub(crate) struct SplittingFilter {
 }
 
 impl SplittingFilter {
+    pub(crate) fn copy_history_from(&mut self, src: &Self) {
+        match (&mut self.state, &src.state) {
+            (FilterState::TwoBand(dst), FilterState::TwoBand(src)) => dst.copy_from_slice(src),
+            (FilterState::ThreeBand(dst), FilterState::ThreeBand(src)) => dst.clone_from_slice(src),
+            _ => unreachable!("both channels must use the same capture format"),
+        }
+    }
+
     /// Create a new splitting filter.
     ///
     /// - `num_channels`: number of audio channels

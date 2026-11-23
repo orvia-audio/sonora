@@ -171,6 +171,40 @@ pub(crate) struct AudioProcessingImpl {
 }
 
 impl AudioProcessingImpl {
+    /// Discard storage unreachable through the fixed noise-only float capture interface.
+    pub(crate) fn retain_mono_noise_capture(&mut self) {
+        self.render.render_audio = None;
+        for buffer in self
+            .capture
+            .capture_audio
+            .iter_mut()
+            .chain(&mut self.capture.capture_fullband_audio)
+        {
+            buffer.release_mono_float_scratch();
+        }
+    }
+
+    /// Fork the capture history of two fixed noise-only pipelines between frames.
+    pub(crate) fn copy_noise_history_from(&mut self, src: &Self) {
+        self.capture
+            .capture_audio
+            .as_mut()
+            .unwrap()
+            .copy_history_from(src.capture.capture_audio.as_ref().unwrap());
+        if let (Some(dst), Some(src)) = (
+            &mut self.capture.capture_fullband_audio,
+            &src.capture.capture_fullband_audio,
+        ) {
+            dst.copy_history_from(src);
+        }
+        self.submodules
+            .high_pass_filter
+            .as_mut()
+            .unwrap()
+            .copy_history_from(src.submodules.high_pass_filter.as_ref().unwrap());
+        self.submodules.noise_suppressors[0].copy_stream_from(&src.submodules.noise_suppressors[0]);
+    }
+
     /// Creates a new audio processing instance with the given configuration.
     pub(crate) fn with_config(config: Config) -> Self {
         let mut apm = Self {
@@ -611,13 +645,14 @@ impl AudioProcessingImpl {
             hpf.process(capture_buffer, true);
         }
 
-        // Phase 6: Noise suppression analysis (before echo cancellation).
-        if !self
-            .config
-            .noise_suppression
-            .as_ref()
-            .is_some_and(|ns| ns.analyze_linear_aec_output_when_available)
-        {
+        // Analyze separately when echo cancellation will change the signal before suppression.
+        let analyze_before_echo = self.submodules.echo_controller.is_some()
+            && !self
+                .config
+                .noise_suppression
+                .as_ref()
+                .is_some_and(|ns| ns.analyze_linear_aec_output_when_available);
+        if analyze_before_echo {
             for (ch, ns) in self.submodules.noise_suppressors.iter_mut().enumerate() {
                 let capture_buffer = self.capture.capture_audio.as_ref().unwrap();
                 let band0 = capture_buffer.split_band(ch, 0);
@@ -638,29 +673,17 @@ impl AudioProcessingImpl {
             ec.process_capture(capture_buffer, None, echo_path_gain_change);
         }
 
-        // Phase 7b: NS analysis on linear AEC output (if configured).
-        if self
-            .config
-            .noise_suppression
-            .as_ref()
-            .is_some_and(|ns| ns.analyze_linear_aec_output_when_available)
-        {
-            for (ch, ns) in self.submodules.noise_suppressors.iter_mut().enumerate() {
-                let capture_buffer = self.capture.capture_audio.as_ref().unwrap();
-                let band0 = capture_buffer.split_band(ch, 0);
-                if let Ok(frame) = <&[f32; 160]>::try_from(band0) {
-                    ns.analyze(frame);
-                }
-            }
-        }
-
-        // Phase 7c: Noise suppression processing.
+        // Noise suppression uses the current capture signal unless it was analyzed before AEC.
         // Process band 0 for each channel (updates Wiener filter + computes upper band gain).
         for (ch, ns) in self.submodules.noise_suppressors.iter_mut().enumerate() {
             let capture_buffer = self.capture.capture_audio.as_mut().unwrap();
             let band0 = capture_buffer.split_band_mut(ch, 0);
             if let Ok(frame) = <&mut [f32; 160]>::try_from(band0) {
-                ns.process(frame);
+                if analyze_before_echo {
+                    ns.process(frame);
+                } else {
+                    ns.analyze_and_process(frame);
+                }
             }
         }
 

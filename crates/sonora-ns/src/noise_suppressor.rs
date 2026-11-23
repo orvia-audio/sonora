@@ -247,7 +247,8 @@ impl FilterBankState {
 /// Single-channel noise suppressor.
 ///
 /// Processes 10ms frames (160 samples at 16kHz) using overlap-add
-/// with a 256-point FFT. Call [`analyze()`](Self::analyze) before [`process()`](Self::process) for each frame.
+/// with a 256-point FFT. Use [`Self::analyze_and_process`] for a single input, or call
+/// [`Self::analyze`] before [`Self::process`] when processing a different signal.
 ///
 /// When operating in multi-band mode (`num_bands > 1`), upper bands must be
 /// processed separately via [`process_upper_band()`](NoiseSuppressor::process_upper_band)
@@ -281,6 +282,31 @@ pub struct NoiseSuppressor {
 }
 
 impl NoiseSuppressor {
+    /// Copy stream history from a suppressor using the same level and number of bands.
+    ///
+    /// The destination reuses its upper-band delay buffers and FFT workspace.
+    pub fn copy_stream_from(&mut self, source: &Self) {
+        assert_eq!(self.num_bands, source.num_bands);
+        assert!(std::ptr::eq(
+            self.suppression_params,
+            source.suppression_params
+        ));
+        self.num_analyzed_frames = source.num_analyzed_frames;
+        self.cached_upper_band_gain = source.cached_upper_band_gain;
+        let src = &source.channel;
+        let dst = &mut self.channel;
+        dst.speech_probability_estimator
+            .clone_from(&src.speech_probability_estimator);
+        dst.noise_estimator.clone_from(&src.noise_estimator);
+        dst.wiener_filter.clone_from(&src.wiener_filter);
+        dst.prev_analysis_signal_spectrum = src.prev_analysis_signal_spectrum;
+        dst.analyze_analysis_memory = src.analyze_analysis_memory;
+        dst.process_analysis_memory = src.process_analysis_memory;
+        dst.process_synthesis_memory = src.process_synthesis_memory;
+        dst.process_delay_memory
+            .copy_from_slice(&src.process_delay_memory);
+    }
+
     /// Create a new single-band noise suppressor with the given configuration.
     pub fn new(config: NsConfig) -> Self {
         let suppression_params = SuppressionParams::for_level(config.target_level);
@@ -327,6 +353,25 @@ impl NoiseSuppressor {
     /// so the noise estimator sees the raw signal (not comfort noise).
     /// `frame` must have exactly [`NS_FRAME_SIZE`] (160) samples.
     pub fn analyze(&mut self, frame: &[f32; NS_FRAME_SIZE]) {
+        self.analyze_frame(frame, false);
+    }
+
+    /// Analyze and suppress the same band-0 frame in place.
+    ///
+    /// This reuses the forward spectrum when analysis and processing have the same overlap.
+    /// Call the separate methods when an echo canceller changes the frame between the two stages.
+    pub fn analyze_and_process(&mut self, frame: &mut [f32; NS_FRAME_SIZE]) {
+        let ch = &self.channel;
+        let matching_overlap = ch
+            .analyze_analysis_memory
+            .iter()
+            .zip(&ch.process_analysis_memory)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        let analyzed_energy = self.analyze_frame(frame, matching_overlap);
+        self.process_frame(frame, analyzed_energy);
+    }
+
+    fn analyze_frame(&mut self, frame: &[f32; NS_FRAME_SIZE], reuse_spectrum: bool) -> Option<f32> {
         let ch = &mut self.channel;
 
         // Prepare the noise estimator.
@@ -344,7 +389,7 @@ impl NoiseSuppressor {
             e
         };
         if energy == 0.0 {
-            return;
+            return None;
         }
 
         // Increment analysis counter.
@@ -364,6 +409,7 @@ impl NoiseSuppressor {
         );
         apply_filterbank_window(&mut fbs.extended_frame);
 
+        let windowed_energy = reuse_spectrum.then(|| compute_energy(&fbs.extended_frame));
         // Compute FFT and magnitude spectrum.
         self.fft
             .fft(&mut fbs.extended_frame, &mut fbs.real, &mut fbs.imag);
@@ -418,6 +464,7 @@ impl NoiseSuppressor {
 
         // Store magnitude spectrum for the process step.
         ch.prev_analysis_signal_spectrum = fbs.signal_spectrum;
+        windowed_energy
     }
 
     /// Apply noise suppression to the band-0 frame.
@@ -430,25 +477,35 @@ impl NoiseSuppressor {
     /// retrieve the gain, and [`process_upper_band()`](Self::process_upper_band) to apply delay and
     /// gain to upper bands.
     pub fn process(&mut self, frame: &mut [f32; NS_FRAME_SIZE]) {
+        self.process_frame(frame, None);
+    }
+
+    fn process_frame(&mut self, frame: &mut [f32; NS_FRAME_SIZE], analyzed_energy: Option<f32>) {
         let ch = &mut self.channel;
         let fbs = &mut self.filter_bank_state;
 
-        // Form extended frame and apply analysis window.
-        form_extended_frame(
-            frame,
-            &mut ch.process_analysis_memory,
-            &mut fbs.extended_frame,
-        );
-        apply_filterbank_window(&mut fbs.extended_frame);
+        let energy_before_filtering = if let Some(energy) = analyzed_energy {
+            ch.process_analysis_memory = ch.analyze_analysis_memory;
+            energy
+        } else {
+            // Form extended frame and apply analysis window.
+            form_extended_frame(
+                frame,
+                &mut ch.process_analysis_memory,
+                &mut fbs.extended_frame,
+            );
+            apply_filterbank_window(&mut fbs.extended_frame);
 
-        let energy_before_filtering = compute_energy(&fbs.extended_frame);
+            let energy = compute_energy(&fbs.extended_frame);
 
-        // FFT and magnitude spectrum.
-        self.fft
-            .fft(&mut fbs.extended_frame, &mut fbs.real, &mut fbs.imag);
+            // FFT and magnitude spectrum.
+            self.fft
+                .fft(&mut fbs.extended_frame, &mut fbs.real, &mut fbs.imag);
 
-        compute_magnitude_spectrum(&fbs.real, &fbs.imag, &mut fbs.signal_spectrum);
+            compute_magnitude_spectrum(&fbs.real, &fbs.imag, &mut fbs.signal_spectrum);
 
+            energy
+        };
         // Update the Wiener filter.
         ch.wiener_filter.update(
             self.num_analyzed_frames,
@@ -576,6 +633,44 @@ mod tests {
     fn with_level_creates_valid_instance() {
         let ns = NoiseSuppressor::with_level(SuppressionLevel::K18dB);
         assert_eq!(ns.num_analyzed_frames, -1);
+    }
+
+    #[test]
+    fn combined_analysis_preserves_pcm_and_upper_band_gain() {
+        let config = NsConfig {
+            target_level: SuppressionLevel::K18dB,
+        };
+        let mut combined = NoiseSuppressor::new_with_bands(config, 2);
+        let mut separate = NoiseSuppressor::new_with_bands(config, 2);
+        for index in 0..160 {
+            let input = std::array::from_fn(|i| match index % 53 {
+                0..=6 => 0.0,
+                7 => -0.0,
+                8..=9 => f32::from_bits(31),
+                _ => ((index * NS_FRAME_SIZE + i) as f32 * 0.074).sin() * 9800.0,
+            });
+            let mut actual = input;
+            let mut expected = input;
+            if index % 37 == 20 {
+                // Resume the combined API with different analyze and process overlaps.
+                combined.analyze(&[1200.0; NS_FRAME_SIZE]);
+                separate.analyze(&[1200.0; NS_FRAME_SIZE]);
+                combined.process(&mut actual);
+            } else {
+                combined.analyze_and_process(&mut actual);
+                separate.analyze(&expected);
+            }
+            separate.process(&mut expected);
+            assert_eq!(
+                actual.map(f32::to_bits),
+                expected.map(f32::to_bits),
+                "frame {index}"
+            );
+            assert_eq!(
+                combined.upper_band_gain().to_bits(),
+                separate.upper_band_gain().to_bits()
+            );
+        }
     }
 
     #[test]

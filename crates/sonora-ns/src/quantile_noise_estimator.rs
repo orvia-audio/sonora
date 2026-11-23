@@ -18,7 +18,7 @@ const SIMULT: usize = 3;
 /// intervals. Each tracker estimates the 25th percentile of the log-spectrum
 /// distribution. When a tracker's counter expires, its estimate is promoted
 /// to the output noise spectrum.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct QuantileNoiseEstimator {
     /// Density estimates, shape `[SIMULT][FFT_SIZE_BY_2_PLUS_1]` flattened.
     density: [f32; SIMULT * FFT_SIZE_BY_2_PLUS_1],

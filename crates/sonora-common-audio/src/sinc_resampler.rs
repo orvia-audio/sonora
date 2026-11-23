@@ -12,7 +12,10 @@
 //! For a **push** model (provide input, get output), see
 //! [`PushSincResampler`](super::push_sinc_resampler).
 
-use std::f64::consts::PI;
+use std::{
+    f64::consts::PI,
+    sync::{Arc, Mutex, Weak},
+};
 
 use derive_more::Debug;
 use sonora_simd::SimdBackend;
@@ -38,7 +41,9 @@ pub struct SincResampler {
 
     /// Kernel storage: `KERNEL_OFFSET_COUNT + 1` kernels of `KERNEL_SIZE` each.
     #[debug(skip)]
-    kernel_storage: Vec<f32>,
+    kernel_storage: Arc<Vec<f32>>,
+    /// For the exact 3:2 ratio, map phase 16 to the second stored pair of rows.
+    phase_shift: u32,
     #[debug(skip)]
     kernel_pre_sinc_storage: Vec<f32>,
     #[debug(skip)]
@@ -89,11 +94,38 @@ fn sinc_scale_factor(io_ratio: f64) -> f64 {
 }
 
 impl SincResampler {
+    pub(crate) fn copy_stream_from(&mut self, source: &Self) {
+        debug_assert_eq!(self.io_sample_rate_ratio, source.io_sample_rate_ratio);
+        debug_assert_eq!(self.request_frames, source.request_frames);
+        self.virtual_source_idx = source.virtual_source_idx;
+        self.buffer_primed = source.buffer_primed;
+        self.block_size = source.block_size;
+        self.input_buffer.copy_from_slice(&source.input_buffer);
+        self.r0 = source.r0;
+        self.r1 = source.r1;
+        self.r2 = source.r2;
+        self.r3 = source.r3;
+        self.r4 = source.r4;
+    }
+
     /// Create a new resampler.
     ///
     /// - `io_sample_rate_ratio`: input / output sample rate ratio
     /// - `request_frames`: number of input frames requested per callback (must be > `KERNEL_SIZE`)
     pub fn new(io_sample_rate_ratio: f64, request_frames: usize) -> Self {
+        Self::with_ratio_tables::<true>(io_sample_rate_ratio, request_frames)
+    }
+
+    /// Construct the private converter used by the fixed-frame push API.
+    /// Its ratio stays constant for the lifetime of the stream.
+    pub(super) fn new_fixed(io_sample_rate_ratio: f64, request_frames: usize) -> Self {
+        Self::with_ratio_tables::<false>(io_sample_rate_ratio, request_frames)
+    }
+
+    fn with_ratio_tables<const RETUNABLE: bool>(
+        io_sample_rate_ratio: f64,
+        request_frames: usize,
+    ) -> Self {
         assert!(
             io_sample_rate_ratio > 0.0 && io_sample_rate_ratio.is_finite(),
             "io_sample_rate_ratio must be positive and finite, got {io_sample_rate_ratio}"
@@ -101,15 +133,44 @@ impl SincResampler {
         assert!(request_frames > 0, "request_frames must be > 0");
         let simd = sonora_simd::detect_backend();
 
+        let compact = !RETUNABLE && io_sample_rate_ratio == 1.5;
+        let table_len = if RETUNABLE { KERNEL_STORAGE_SIZE } else { 0 };
+        // Only Orvia's fixed converter pair shares kernels. Keep a weak outer allocation
+        // so closing the last active stream also frees its coefficient vector.
+        static DOWN: Mutex<Weak<Vec<f32>>> = Mutex::new(Weak::new());
+        static UP: Mutex<Weak<Vec<f32>>> = Mutex::new(Weak::new());
+        let cache = if RETUNABLE {
+            None
+        } else if compact {
+            Some(&DOWN)
+        } else if io_sample_rate_ratio == 2. / 3. {
+            Some(&UP)
+        } else {
+            None
+        };
+        let mut cache = cache.map(|slot| slot.lock().unwrap_or_else(|poison| poison.into_inner()));
+        let shared = cache.as_ref().and_then(|slot| slot.upgrade());
+        let needs_kernel = shared.is_none();
+        let kernel_storage = shared.unwrap_or_else(|| {
+            Arc::new(vec![
+                0.;
+                if compact {
+                    4 * KERNEL_SIZE
+                } else {
+                    KERNEL_STORAGE_SIZE
+                }
+            ])
+        });
         let mut resampler = Self {
             io_sample_rate_ratio,
             virtual_source_idx: 0.0,
             buffer_primed: false,
             request_frames,
             block_size: 0,
-            kernel_storage: vec![0.0; KERNEL_STORAGE_SIZE],
-            kernel_pre_sinc_storage: vec![0.0; KERNEL_STORAGE_SIZE],
-            kernel_window_storage: vec![0.0; KERNEL_STORAGE_SIZE],
+            kernel_storage,
+            phase_shift: if compact { 3 } else { 0 },
+            kernel_pre_sinc_storage: vec![0.0; table_len],
+            kernel_window_storage: vec![0.0; table_len],
             input_buffer: vec![0.0; request_frames + KERNEL_SIZE],
             r0: 0,
             r1: 0,
@@ -121,7 +182,12 @@ impl SincResampler {
 
         resampler.update_regions(false);
         assert!(resampler.block_size > KERNEL_SIZE);
-        resampler.initialize_kernel();
+        if needs_kernel {
+            resampler.initialize_kernel::<RETUNABLE>();
+            if let Some(slot) = cache.as_mut() {
+                **slot = Arc::downgrade(&resampler.kernel_storage);
+            }
+        }
         resampler
     }
 
@@ -160,12 +226,13 @@ impl SincResampler {
 
         // Re-use pre-computed sinc and window values.
         let scale = sinc_scale_factor(io_sample_rate_ratio);
+        let kernel = Arc::get_mut(&mut self.kernel_storage).expect("retunable kernels are private");
         for offset_idx in 0..=KERNEL_OFFSET_COUNT {
             for i in 0..KERNEL_SIZE {
                 let idx = i + offset_idx * KERNEL_SIZE;
                 let window = self.kernel_window_storage[idx];
                 let pre_sinc = self.kernel_pre_sinc_storage[idx];
-                self.kernel_storage[idx] = (window as f64
+                kernel[idx] = (window as f64
                     * if pre_sinc == 0.0 {
                         scale
                     } else {
@@ -215,7 +282,7 @@ impl SincResampler {
                 let virtual_offset_idx = subsample_remainder * KERNEL_OFFSET_COUNT as f64;
                 let offset_idx = virtual_offset_idx as usize;
 
-                let k1_start = offset_idx * KERNEL_SIZE;
+                let k1_start = (offset_idx >> self.phase_shift) * KERNEL_SIZE;
                 let k2_start = k1_start + KERNEL_SIZE;
 
                 let input_start = self.r1 + source_idx;
@@ -266,7 +333,7 @@ impl SincResampler {
         self.block_size = self.r4 - self.r2;
     }
 
-    fn initialize_kernel(&mut self) {
+    fn initialize_kernel<const RETUNABLE: bool>(&mut self) {
         // Blackman window parameters.
         let k_alpha = 0.16_f64;
         let k_a0 = 0.5 * (1.0 - k_alpha);
@@ -274,21 +341,32 @@ impl SincResampler {
         let k_a2 = 0.5 * k_alpha;
 
         let scale = sinc_scale_factor(self.io_sample_rate_ratio);
+        let kernel = Arc::get_mut(&mut self.kernel_storage).expect("new kernel is private");
 
         for offset_idx in 0..=KERNEL_OFFSET_COUNT {
+            // Adding 1.5 to an integer/half-integer and wrapping at an integer block size
+            // reaches only phases 0 and 16. SIMD reads the following interpolation row too.
+            let row = if self.phase_shift == 0 {
+                offset_idx
+            } else {
+                match offset_idx {
+                    0 | 1 => offset_idx,
+                    16 | 17 => offset_idx - 14,
+                    _ => continue,
+                }
+            };
             // C++ computes subsample_offset as float:
             //   const float subsample_offset =
             //       static_cast<float>(offset_idx) / kKernelOffsetCount;
             let subsample_offset = offset_idx as f32 / KERNEL_OFFSET_COUNT as f32;
 
             for i in 0..KERNEL_SIZE {
-                let idx = i + offset_idx * KERNEL_SIZE;
+                let idx = i + row * KERNEL_SIZE;
 
                 // C++: pi * (int(i) - int(kKernelSize/2) - subsample_offset)
                 // subsample_offset is float, subtraction in float, then
                 // promoted to double for the pi multiply.
                 let pre_sinc = PI * (i as f32 - HALF_KERNEL as f32 - subsample_offset) as f64;
-                self.kernel_pre_sinc_storage[idx] = pre_sinc as f32;
 
                 // C++: (i - subsample_offset) / kKernelSize — all float
                 let x = (i as f32 - subsample_offset) / KERNEL_SIZE as f32;
@@ -296,7 +374,10 @@ impl SincResampler {
                 // C++ window uses double constants, trig in double, cast to float
                 let window =
                     k_a0 - k_a1 * (2.0 * PI * x as f64).cos() + k_a2 * (4.0 * PI * x as f64).cos();
-                self.kernel_window_storage[idx] = window as f32;
+                if RETUNABLE {
+                    self.kernel_pre_sinc_storage[idx] = pre_sinc as f32;
+                    self.kernel_window_storage[idx] = window as f32;
+                }
 
                 // Windowed sinc
                 let sinc_val = if pre_sinc == 0.0 {
@@ -304,7 +385,7 @@ impl SincResampler {
                 } else {
                     (scale * pre_sinc).sin() / pre_sinc
                 };
-                self.kernel_storage[idx] = (window * sinc_val) as f32;
+                kernel[idx] = (window * sinc_val) as f32;
             }
         }
     }
@@ -448,6 +529,49 @@ mod tests {
 
         // Both runs should produce similar output (the filter re-primes).
         assert!((output[chunk - 1] - output2[chunk - 1]).abs() < 0.01);
+    }
+
+    #[test]
+    fn fixed_ratios_keep_only_the_active_kernel() {
+        for (source, destination) in [(480, 320), (320, 480), (441, 480), (480, 480)] {
+            let ratio = source as f64 / destination as f64;
+            let fixed = SincResampler::new_fixed(ratio, source);
+            let adjustable = SincResampler::new(ratio, source);
+            assert_eq!(fixed.kernel_pre_sinc_storage.capacity(), 0);
+            assert_eq!(fixed.kernel_window_storage.capacity(), 0);
+            assert_eq!(
+                adjustable.kernel_pre_sinc_storage.len(),
+                KERNEL_STORAGE_SIZE
+            );
+            assert_eq!(adjustable.kernel_window_storage.len(), KERNEL_STORAGE_SIZE);
+            let phases: Vec<_> = if ratio == 1.5 {
+                vec![0, 1, 16, 17]
+            } else {
+                (0..=KERNEL_OFFSET_COUNT).collect()
+            };
+            assert_eq!(fixed.kernel_storage.len(), phases.len() * KERNEL_SIZE);
+            for (&phase, actual) in phases
+                .iter()
+                .zip(fixed.kernel_storage.chunks_exact(KERNEL_SIZE))
+            {
+                let start = phase * KERNEL_SIZE;
+                assert_eq!(
+                    actual,
+                    &adjustable.kernel_storage[start..start + KERNEL_SIZE]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_simultaneous_fixed_voice_converters_share_coefficients() {
+        for (ratio, frames) in [(1.5, 480), (2. / 3., 320)] {
+            let a = SincResampler::new_fixed(ratio, frames);
+            let b = SincResampler::new_fixed(ratio, frames);
+            let adjustable = SincResampler::new(ratio, frames);
+            assert!(Arc::ptr_eq(&a.kernel_storage, &b.kernel_storage));
+            assert!(!Arc::ptr_eq(&a.kernel_storage, &adjustable.kernel_storage));
+        }
     }
 
     #[test]

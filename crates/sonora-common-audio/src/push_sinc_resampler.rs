@@ -66,6 +66,19 @@ pub struct PushSincResampler {
 }
 
 impl PushSincResampler {
+    /// Release the conversion buffer for a route using only floating-point samples.
+    /// Calling the integer interface later recreates its temporary storage.
+    pub fn release_integer_scratch(&mut self) {
+        self.source_float_buffer = Vec::new();
+    }
+
+    /// Copy the position and signal history of an identically configured resampler.
+    /// The immutable kernels and scratch buffers are reused.
+    pub fn copy_stream_from(&mut self, source: &Self) {
+        self.first_pass = source.first_pass;
+        self.resampler.copy_stream_from(&source.resampler);
+    }
+
     /// Create a new push resampler.
     ///
     /// - `source_frames`: number of input frames per call (e.g. 480 for 10ms at 48kHz)
@@ -77,7 +90,7 @@ impl PushSincResampler {
         assert!(destination_frames > 0);
         let ratio = source_frames as f64 / destination_frames as f64;
         Self {
-            resampler: SincResampler::new(ratio, source_frames),
+            resampler: SincResampler::new_fixed(ratio, source_frames),
             source_float_buffer: vec![0.0; source_frames],
             dest_float_buffer: Vec::new(),
             destination_frames,
@@ -131,6 +144,7 @@ impl PushSincResampler {
         assert!(destination.len() >= self.destination_frames);
 
         // Convert i16 → f32 into reusable buffer (no allocation).
+        self.source_float_buffer.resize(source.len(), 0.);
         for (d, &s) in self.source_float_buffer.iter_mut().zip(source) {
             *d = s as f32;
         }

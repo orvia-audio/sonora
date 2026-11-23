@@ -11,7 +11,7 @@ use crate::fast_math::sqrt_fast_approximation;
 use crate::suppression_params::SuppressionParams;
 
 /// Wiener filter for noise suppression.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct WienerFilter {
     suppression_params: &'static SuppressionParams,
     spectrum_prev_process: [f32; FFT_SIZE_BY_2_PLUS_1],

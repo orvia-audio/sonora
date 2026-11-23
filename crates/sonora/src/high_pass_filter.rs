@@ -80,6 +80,12 @@ pub struct HighPassFilter {
 }
 
 impl HighPassFilter {
+    pub(crate) fn copy_history_from(&mut self, src: &Self) {
+        for (dst, src) in self.filters.iter_mut().zip(&src.filters) {
+            dst.copy_stream_from(src);
+        }
+    }
+
     pub fn new(sample_rate_hz: i32, num_channels: usize) -> Self {
         let coefficients = choose_coefficients(sample_rate_hz);
         let filters = (0..num_channels)

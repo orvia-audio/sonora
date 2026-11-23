@@ -154,7 +154,7 @@ fn filter_core<const FMA: bool>(
 }
 
 /// 3-band QMF filter bank for analysis and synthesis.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ThreeBandFilterBank {
     state_analysis: [[f32; MEMORY_SIZE]; NUM_NON_ZERO_FILTERS],
     state_synthesis: [[f32; MEMORY_SIZE]; NUM_NON_ZERO_FILTERS],

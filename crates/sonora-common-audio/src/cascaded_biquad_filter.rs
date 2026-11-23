@@ -45,6 +45,15 @@ pub struct CascadedBiQuadFilter {
 }
 
 impl CascadedBiQuadFilter {
+    /// Copy the delay elements of a filter with the same coefficients and section count.
+    pub fn copy_stream_from(&mut self, source: &Self) {
+        assert_eq!(self.biquads.len(), source.biquads.len());
+        for (dst, src) in self.biquads.iter_mut().zip(&source.biquads) {
+            dst.x = src.x;
+            dst.y = src.y;
+        }
+    }
+
     /// Creates a new cascaded filter from the given second-order sections.
     pub fn new(coefficients: &[BiQuadCoefficients]) -> Self {
         Self {

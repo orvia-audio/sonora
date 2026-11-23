@@ -22,7 +22,7 @@ pub(crate) struct SignalAnalysis<'a> {
 }
 
 /// Per-bin speech probability estimator.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct SpeechProbabilityEstimator {
     signal_model_estimator: SignalModelEstimator,
     prior_speech_prob: f32,

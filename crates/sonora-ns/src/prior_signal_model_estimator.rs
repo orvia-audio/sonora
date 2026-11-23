@@ -100,7 +100,7 @@ fn update_lrt(lrt_histogram: &[i32; HISTOGRAM_SIZE]) -> (f32, bool) {
 }
 
 /// Estimator that derives prior signal model parameters from feature histograms.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PriorSignalModelEstimator {
     prior_model: PriorSignalModel,
 }
